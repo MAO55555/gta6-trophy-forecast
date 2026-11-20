@@ -7,15 +7,11 @@ Features:
 - Exophase refresh deduplication (filtering page cache duplicates).
 - Post-launch filtering (drops pre-launch cohort N < 2000 when N >= 2000 is established).
 - 2-refresh launch-transition guard: avoids extrapolating one-off pre-launch drops.
-- Zero-floor handling: conservative median with wide spread covering week-1 first unlocks.
-- Laplace smoothing ((E + 0.25) / (N + 50.0)) and leading-zero filtering in logit regression
-  with saturation damping at long horizons.
-- Recency-weighted interval marginal earner rate (dE / dN) blended with overall velocity
-  and shrunk toward current rate prior.
-- Self-calibrating internal rolling-origin backtest measuring out-of-sample logit error
-  vs horizon delta_tau to set empirical spread scale dynamically (bounded in [0.18, 1.35]).
-- Single-refresh launch regime with calibrated tails (q05 in 80-90% for r >= 95%,
-  differentiated dilution shift for r < 95%).
+- N-aware zero-earner floor scaling smoothly with 1/N_target and horizon, with a calibrated upper tail.
+- Progressing mid/late-story cohort handling: dynamic shrinkage reduction when m_recent > p_prior.
+- Consistent 3-cutoff rolling-origin backtest evaluating the actual blended predictor.
+- Heteroscedastic per-trophy spread: diffusion + regression fit + Poisson count + model disagreement.
+- Calibrated launch regime (r >= 99% tutorial trophy near 99.9%, r < 95% tightened to 0.64-0.70 spread).
 - Strict isotonic hierarchy refinement: downstream story mission rates clamped <= upstream
   prerequisites without corrupting early high-confidence trophies, Platinum <= min(others).
 - Robust to null rates, 0%, 100%, arbitrary trophy counts, and single-read histories.
@@ -128,17 +124,21 @@ def forecast_single_refresh(
 
     rows: list[dict[str, Any]] = []
     for i, trophy in enumerate(trophies):
-        r = raw_rates[i] if i < len(raw_rates) and raw_rates[i] is not None else 0.0
+        r = float(raw_rates[i]) if i < len(raw_rates) and raw_rates[i] is not None else 0.0
         r_clamped = clamp(r)
 
         if n_players < 2500:
-            if r_clamped >= 95.0:
-                # Widen lower tail so q05 is around 80-90% in case launch players drop below 99%
-                mu = 3.9
-                spread = 1.30
+            if r >= 99.0:
+                # Tutorial / intro trophy (e.g. Gone Fishing, 100% in p00/p01)
+                # Stays near 100% at global launch; keep mu high (~99.88%) with calibrated spread
+                mu = 6.70
+                spread = 0.65
+            elif r_clamped >= 95.0:
+                # Near-universal trophy with slight dilution
+                mu = logit(r_clamped) - 0.25
+                spread = 0.70
             else:
-                # Dilution shift between -1.1 and -1.35 logit accounting for expected launch refresh.
-                # Slightly deeper for platinum / 100% / 250-stunt / gold trophies than early Chapter 1.
+                # Trophies below 95%: expected launch dilution
                 tier = str(trophy.get("tier", "")).lower()
                 name = str(trophy.get("name", "")).lower()
                 desc = str(trophy.get("description", "")).lower()
@@ -159,20 +159,20 @@ def forecast_single_refresh(
                 )
 
                 if is_hard_or_endgame:
-                    shift = -1.35
-                    spread = 0.90
+                    shift = -1.30
+                    spread = 0.70
                 elif is_early_progression:
                     shift = -1.10
-                    spread = 0.85
+                    spread = 0.64
                 else:
-                    shift = -1.22
-                    spread = 0.88
+                    shift = -1.20
+                    spread = 0.68
 
                 mu = logit(r_clamped) + shift
         else:
-            # Established player base: standard persistence with calibrated random walk spread
+            # Established player base
             mu = logit(r_clamped)
-            spread = max(0.25, 0.40 * math.sqrt(d_days))
+            spread = max(0.22, 0.35 * math.sqrt(d_days))
 
         q_vals = [round4(inv_logit(mu + z * spread)) for z in Z]
         # Enforce monotonicity and [0, 100] bounds
@@ -186,75 +186,233 @@ def forecast_single_refresh(
     return rows
 
 
+def predict_blended(
+    records: list[dict[str, Any]],
+    tau_vals: list[float],
+    n_vals: list[float],
+    t_vals: list[float],
+    target_tau: float,
+    num_trophies: int,
+    horizon_days: float,
+) -> list[dict[str, Any]]:
+    """Unified blended predictor (damped logit trend + recency-weighted interval earner growth).
+
+    Used for both the rolling-origin backtest and the primary target forecast to ensure
+    100% mathematical consistency.
+    """
+    m = len(records)
+    t_last = t_vals[-1]
+    tau_last = tau_vals[-1]
+    n_last = n_vals[-1]
+    delta_tau = max(0.0, target_tau - tau_last)
+    delta_tau_eff = delta_tau / (1.0 + 0.20 * delta_tau)
+
+    # Exponential recency weights: half-life of 18 hours
+    half_life_sec = 18.0 * 3600.0
+    decay_rate = math.log(2.0) / half_life_sec
+    raw_weights = [math.exp(-decay_rate * max(0.0, t_last - t)) for t in t_vals]
+    sum_w = sum(raw_weights)
+    weights = [w / sum_w for w in raw_weights]
+
+    tau_mean = sum(w * t for w, t in zip(weights, tau_vals))
+    s_tt = sum(w * ((t - tau_mean) ** 2) for w, t in zip(weights, tau_vals))
+
+    ln_n_vals = [math.log(n) for n in n_vals]
+    ln_n_mean = sum(w * ln_n for w, ln_n in zip(weights, ln_n_vals))
+    s_t_ln_n = sum(w * (t - tau_mean) * (ln_n - ln_n_mean) for w, t, ln_n in zip(weights, tau_vals, ln_n_vals))
+
+    ridge_n = 0.1 * s_tt
+    slope_n = s_t_ln_n / (s_tt + ridge_n) if (s_tt + ridge_n) > 1e-9 else 0.0
+    slope_n = max(0.0, min(1.2, slope_n))
+    ln_n_target = ln_n_vals[-1] + slope_n * delta_tau_eff
+    n_target = max(n_vals[-1], math.exp(ln_n_target))
+    delta_n_proj = max(0.0, n_target - n_vals[-1])
+
+    decay_int = math.log(2.0) / (14.0 * 3600.0)
+
+    preds: list[dict[str, Any]] = []
+
+    for i in range(num_trophies):
+        earner_series: list[int] = []
+        last_valid_rate = 0.0
+        for idx, r in enumerate(records):
+            rates = r.get("rates", [])
+            rate_val = float(rates[i]) if i < len(rates) and rates[i] is not None else None
+            if rate_val is not None:
+                last_valid_rate = rate_val
+            e_count = round((last_valid_rate / 100.0) * n_vals[idx]) if last_valid_rate > 0.0 else 0
+            earner_series.append(e_count)
+
+        last_earners = earner_series[-1]
+
+        # N-aware zero-earner floor:
+        # At large N (e.g. 10k-50k), 0.00% means <0.005%. Expected earners scale with 1/N_target and horizon.
+        if last_earners == 0:
+            e_exp = 0.25 * (1.0 + 0.40 * math.sqrt(horizon_days))
+            p_zero = max(0.005, (e_exp / n_target) * 100.0)
+            mu_zero = logit(p_zero)
+            preds.append({
+                "mu": mu_zero,
+                "y_logit": mu_zero,
+                "y_earner": mu_zero,
+                "s_res": 0.15,
+                "var_slope": 0.0,
+                "last_earners": 0,
+                "is_zero": True,
+            })
+            continue
+
+        # Filter excessive leading zeros
+        first_nonzero_idx = next((idx for idx, e in enumerate(earner_series) if e > 0), 0)
+        start_reg_idx = max(0, first_nonzero_idx - 1)
+
+        sub_weights = weights[start_reg_idx:]
+        sub_sum_w = sum(sub_weights)
+        norm_weights = [w / sub_sum_w for w in sub_weights] if sub_sum_w > 0 else [1.0 / len(sub_weights)] * len(sub_weights)
+        sub_tau = tau_vals[start_reg_idx:]
+        sub_n = n_vals[start_reg_idx:]
+        sub_e = earner_series[start_reg_idx:]
+
+        y_smoothed = [logit(((e + 0.25) / (n + 50.0)) * 100.0) for e, n in zip(sub_e, sub_n)]
+        sub_tau_mean = sum(w * t for w, t in zip(norm_weights, sub_tau))
+        sub_s_tt = sum(w * ((t - sub_tau_mean) ** 2) for w, t in zip(norm_weights, sub_tau))
+        y_sm_mean = sum(w * y for w, y in zip(norm_weights, y_smoothed))
+        s_ty = sum(w * (t - sub_tau_mean) * (y - y_sm_mean) for w, t, y in zip(norm_weights, sub_tau, y_smoothed))
+
+        ridge_y = 0.25 * sub_s_tt
+        slope_y = s_ty / (sub_s_tt + ridge_y) if (sub_s_tt + ridge_y) > 1e-9 else 0.0
+        slope_y = min(1.0, max(-1.0, slope_y))
+        y_logit_pred = y_smoothed[-1] + slope_y * delta_tau_eff
+
+        # Recency-weighted interval marginal rate (dE / dN)
+        int_recent_num = 0.0
+        int_recent_den = 0.0
+        for k in range(1, m):
+            dn = n_vals[k] - n_vals[k - 1]
+            if dn > 0:
+                de = max(0, earner_series[k] - earner_series[k - 1])
+                m_k = min(1.0, de / dn)
+                t_mid = 0.5 * (t_vals[k] + t_vals[k - 1])
+                w_k = dn * math.exp(-decay_int * max(0.0, t_last - t_mid))
+                int_recent_num += w_k * m_k
+                int_recent_den += w_k
+
+        m_recent = (int_recent_num / int_recent_den) if int_recent_den > 0 else (clamp(last_valid_rate) / 100.0)
+        tot_dn = n_vals[-1] - n_vals[0]
+        tot_de = max(0, earner_series[-1] - earner_series[0])
+        m_overall = (tot_de / tot_dn) if tot_dn > 50 else (clamp(last_valid_rate) / 100.0)
+
+        m_emp = 0.65 * m_recent + 0.35 * m_overall
+        p_prior = max(0.0001, min(0.9999, (last_earners + 0.25) / (n_vals[-1] + 50.0)))
+
+        # Dynamic prior weighting for progressing cohorts (e.g. launch buyers reaching mid/late chapters)
+        rho = m_recent / p_prior
+        w_prior = max(0.12, 0.40 / math.sqrt(rho)) if rho > 1.0 else 0.40
+        w_emp = 1.0 - w_prior
+        marginal_rate = w_emp * m_emp + w_prior * p_prior
+
+        e_target = last_earners + marginal_rate * delta_n_proj
+        e_target = max(last_earners, min(n_target, e_target))
+        r_earner_pred = (e_target / n_target) * 100.0 if n_target > 0 else 0.01
+        y_earner_pred = logit(r_earner_pred)
+
+        # 50/50 blend of damped logit trend and physical earner growth
+        mu_combined = 0.50 * y_logit_pred + 0.50 * y_earner_pred
+        r_floor = (last_earners / n_target) * 100.0 if n_target > 0 else 0.01
+        mu_floor = logit(r_floor)
+        mu_combined = max(mu_floor, mu_combined)
+
+        if len(sub_tau) > 2 and sub_s_tt > 1e-9:
+            res_sum_sq = sum(w * ((y - (y_sm_mean + slope_y * (t - sub_tau_mean))) ** 2) for w, t, y in zip(norm_weights, sub_tau, y_smoothed))
+            s_res_sq = res_sum_sq / max(1e-4, 1.0 - sum(w * w for w in norm_weights))
+            var_slope = (s_res_sq / sub_s_tt) * (delta_tau_eff ** 2)
+            s_res = math.sqrt(min(0.35, s_res_sq))
+        else:
+            s_res = 0.18
+            var_slope = 0.0
+
+        preds.append({
+            "mu": mu_combined,
+            "y_logit": y_logit_pred,
+            "y_earner": y_earner_pred,
+            "s_res": s_res,
+            "var_slope": var_slope,
+            "last_earners": last_earners,
+            "is_zero": False,
+        })
+
+    return preds
+
+
 def calibrate_spread_scale_backtest(
     valid_records: list[dict[str, Any]],
     tau_vals: list[float],
     n_vals: list[float],
+    t_vals: list[float],
     num_trophies: int,
 ) -> float:
-    """Run a fast rolling-origin backtest to measure empirical logit prediction error scale.
+    """Run a fast rolling-origin backtest evaluating the actual blended predictor across 3 cutoffs (~50%, ~67%, ~82%).
 
-    Evaluates 2 cutoffs (60% and 80% mark) predicting the latest history refresh.
-    Returns empirical error scale per sqrt(delta_tau), blended with safe prior.
+    Measures empirical logit prediction error scale per sqrt(delta_tau_eff) to calibrate
+    diffusion spread toward nominal 90% coverage.
     """
     m = len(valid_records)
     if m < 8:
-        return 0.32
+        return 0.26
 
-    cutoffs = [max(4, int(0.60 * m)), max(6, int(0.80 * m))]
+    cutoffs = [
+        max(3, int(0.50 * m)),
+        max(4, int(0.67 * m)),
+        max(5, int(0.82 * m)),
+    ]
+    cutoffs = sorted(list(set(c for c in cutoffs if c < m - 1)))
+    if not cutoffs:
+        return 0.26
+
     target_idx = m - 1
-    tau_target = tau_vals[target_idx]
+    target_tau = tau_vals[target_idx]
     target_rec = valid_records[target_idx]
     target_rates = target_rec.get("rates", [])
+    target_n = n_vals[target_idx]
 
     scales: list[float] = []
 
     for c in cutoffs:
-        if c >= target_idx:
-            continue
-        d_tau = max(1e-4, tau_target - tau_vals[c])
-        train_tau = tau_vals[: c + 1]
-        train_n = n_vals[: c + 1]
-        tau_mean = sum(train_tau) / len(train_tau)
-        s_tt = sum((t - tau_mean) ** 2 for t in train_tau)
+        d_tau = max(1e-4, target_tau - tau_vals[c])
+        d_tau_eff = d_tau / (1.0 + 0.20 * d_tau)
+        horizon_days = max(1e-4, (t_vals[target_idx] - t_vals[c]) / 86400.0)
+
+        # Predict using blended model on sub-history 0..c
+        sub_preds = predict_blended(
+            valid_records[: c + 1],
+            tau_vals[: c + 1],
+            n_vals[: c + 1],
+            t_vals[: c + 1],
+            target_tau,
+            num_trophies,
+            horizon_days,
+        )
 
         errors_sq: list[float] = []
-
         for i in range(num_trophies):
-            y_train = []
-            for k in range(c + 1):
-                rates = valid_records[k].get("rates", [])
-                r_val = float(rates[i]) if i < len(rates) and rates[i] is not None else 0.0
-                e_cnt = round((r_val / 100.0) * train_n[k]) if r_val > 0.0 else 0
-                p_sm = (e_cnt + 0.25) / (train_n[k] + 50.0)
-                y_train.append(logit(p_sm * 100.0))
-
-            y_mean = sum(y_train) / len(y_train)
-            s_ty = sum((t - tau_mean) * (y - y_mean) for t, y in zip(train_tau, y_train))
-            ridge = 0.25 * s_tt
-            slope = s_ty / (s_tt + ridge) if (s_tt + ridge) > 1e-9 else 0.0
-            slope = min(1.0, max(-1.0, slope))
-
-            y_pred = y_train[-1] + slope * d_tau
-
+            mu_pred = sub_preds[i]["mu"]
             actual_r = float(target_rates[i]) if i < len(target_rates) and target_rates[i] is not None else 0.0
-            actual_e = round((actual_r / 100.0) * n_vals[target_idx]) if actual_r > 0.0 else 0
-            actual_p = (actual_e + 0.25) / (n_vals[target_idx] + 50.0)
+            actual_e = round((actual_r / 100.0) * target_n) if actual_r > 0.0 else 0
+            actual_p = (actual_e + 0.25) / (target_n + 50.0)
             y_actual = logit(actual_p * 100.0)
-
-            errors_sq.append((y_actual - y_pred) ** 2)
+            errors_sq.append((y_actual - mu_pred) ** 2)
 
         if errors_sq:
             rmse = math.sqrt(sum(errors_sq) / len(errors_sq))
-            scales.append(rmse / math.sqrt(d_tau))
+            scales.append(rmse / math.sqrt(d_tau_eff))
 
     if not scales:
-        return 0.32
+        return 0.26
 
     scale_empirical = sum(scales) / len(scales)
-    # Blend with safe prior 0.32
-    scale_calib = 0.65 * scale_empirical + 0.35 * 0.32
-    return max(0.15, min(0.70, scale_calib))
+    # Blend with safe calibrated prior 0.26
+    scale_calib = 0.65 * scale_empirical + 0.35 * 0.26
+    return max(0.12, min(0.48, scale_calib))
 
 
 def forecast_multi_refresh(
@@ -263,41 +421,27 @@ def forecast_multi_refresh(
     target_ts: float,
     horizon_minutes: float,
 ) -> list[dict[str, Any]]:
-    """Forecast when history contains multiple distinct refreshes (e.g. final case f00).
-
-    1. Post-launch filtering: drops pre-launch cohort (N < 2000) when >=3 post-launch refreshes exist.
-    2. 2-refresh launch-transition guard: avoids extrapolating one-off pre-launch drops.
-    3. Laplace smoothing and leading-zero filtering in logit regression with saturation damping.
-    4. Wide spread for zero-earner trophies covering week-1 first unlocks.
-    5. Recency-weighted interval marginal earner rate (dE / dN) combined with damped logit trend.
-    6. Self-calibrating rolling-origin backtest for empirical spread scaling (spread in [0.18, 1.35]).
-    7. Clean isotonic hierarchy refinement: downstream story clamped <= upstream, Platinum <= min(others).
-    """
+    """Forecast when history contains multiple distinct refreshes (e.g. final case f00)."""
     last_read = refreshes[-1]
     t_last = parse_iso(last_read.get("at", last_read.get("slot", "")))
     d_days = max(1e-4, horizon_minutes / 1440.0)
 
-    # 1. Post-launch filtering: when at least 3 distinct refreshes have players_tracked >= 2000,
-    # drop the initial pre-launch cohort (players_tracked < 2000) from the trend fit
+    # 1. Post-launch filtering
     post_launch = [r for r in refreshes if (r.get("players_tracked", 0) or 0) >= 2000]
     active_refreshes = post_launch if len(post_launch) >= 3 else refreshes
 
-    # 2. 2-refresh launch-transition guard:
-    # If len(post_launch) < 3 and active_refreshes has a massive one-off cohort jump (N_end / N_start > 2.5),
-    # do NOT extrapolate that pre-launch drop as a multi-day slope; fall back to single-refresh persistence.
+    # 2. 2-refresh launch-transition guard
     if len(post_launch) < 3 and len(active_refreshes) >= 2:
         n_start = float(active_refreshes[0].get("players_tracked", 1) or 1)
         n_end = float(active_refreshes[-1].get("players_tracked", 1) or 1)
         if n_end / max(1.0, n_start) > 2.5:
             return forecast_single_refresh(trophies, active_refreshes[-1], horizon_minutes)
 
-    # Window of recent refreshes: up to last 40 refreshes or last 48 hours
     cutoff_ts = t_last - 48.0 * 3600.0
     window = [r for r in active_refreshes if parse_iso(r.get("at", r.get("slot", ""))) >= cutoff_ts]
     if len(window) < 6:
         window = active_refreshes[-min(len(active_refreshes), 20) :]
 
-    # Extract timestamps, tau = ln(1 + hours_from_launch), and player counts N
     tau_vals: list[float] = []
     n_vals: list[float] = []
     t_vals: list[float] = []
@@ -323,152 +467,43 @@ def forecast_multi_refresh(
     tau_target = math.log(1.0 + target_hrs)
     tau_last = tau_vals[-1]
     delta_tau = max(0.0, tau_target - tau_last)
-
-    # Gentle saturation damping on long horizons: prevents extreme multi-day overshoots
     delta_tau_eff = delta_tau / (1.0 + 0.20 * delta_tau)
 
-    # Exponential recency weights: half-life of 18 hours
-    half_life_sec = 18.0 * 3600.0
-    decay_rate = math.log(2.0) / half_life_sec
-    raw_weights = [math.exp(-decay_rate * max(0.0, t_last - t)) for t in t_vals]
-    sum_w = sum(raw_weights)
-    weights = [w / sum_w for w in raw_weights]
-
-    # Weighted mean of tau and variance s_tt
-    tau_mean = sum(w * tau for w, tau in zip(weights, tau_vals))
-    s_tt = sum(w * ((tau - tau_mean) ** 2) for w, tau in zip(weights, tau_vals))
-
-    # Fit player growth ln(N) vs tau with weighted regression
-    ln_n_vals = [math.log(n) for n in n_vals]
-    ln_n_mean = sum(w * ln_n for w, ln_n in zip(weights, ln_n_vals))
-    s_t_ln_n = sum(w * (tau - tau_mean) * (ln_n - ln_n_mean) for w, tau, ln_n in zip(weights, tau_vals, ln_n_vals))
-
-    ridge_n = 0.1 * s_tt
-    slope_n = s_t_ln_n / (s_tt + ridge_n) if (s_tt + ridge_n) > 1e-9 else 0.0
-    slope_n = max(0.0, min(1.2, slope_n))
-    ln_n_target = ln_n_vals[-1] + slope_n * delta_tau_eff
-    n_target = max(n_vals[-1], math.exp(ln_n_target))
-    delta_n_proj = max(0.0, n_target - n_vals[-1])
-
-    # Self-calibrating empirical spread scale from rolling backtest
     num_trophies = len(trophies)
-    calib_scale = calibrate_spread_scale_backtest(valid_records, tau_vals, n_vals, num_trophies)
+
+    # Consistent 3-cutoff rolling backtest
+    calib_scale = calibrate_spread_scale_backtest(valid_records, tau_vals, n_vals, t_vals, num_trophies)
     sigma_diffusion = calib_scale * math.sqrt(max(1e-4, delta_tau_eff))
+
+    # Evaluate unified blended predictor on the target horizon
+    preds = predict_blended(valid_records, tau_vals, n_vals, t_vals, tau_target, num_trophies, d_days)
 
     pred_medians: list[float] = [0.0] * num_trophies
     pred_spreads: list[float] = [0.35] * num_trophies
 
     for i in range(num_trophies):
-        # Extract earner counts and raw rates across the window
-        earner_series: list[int] = []
-        last_valid_rate = 0.0
+        p_info = preds[i]
+        pred_medians[i] = p_info["mu"]
 
-        for idx, r in enumerate(valid_records):
-            rates = r.get("rates", [])
-            rate_val = float(rates[i]) if i < len(rates) and rates[i] is not None else None
-            if rate_val is not None:
-                last_valid_rate = rate_val
-            e_count = round((last_valid_rate / 100.0) * n_vals[idx]) if last_valid_rate > 0.0 else 0
-            earner_series.append(e_count)
-
-        last_earners = earner_series[-1]
-
-        # 1. Zero-floor handling:
-        # If trophy has 0.00% at the cut (last_earners == 0):
-        # Keep median conservative near Laplace prior (~0.04%), but widen spread
-        # (max(0.95, min(1.35, 1.8 * sigma_diffusion))) so q75 / q95 safely cover week-1 first unlocks.
-        if last_earners == 0:
-            mu_zero = logit(0.04)
-            spread_zero = max(0.95, min(1.35, 1.8 * sigma_diffusion))
-            pred_medians[i] = mu_zero
-            pred_spreads[i] = spread_zero
-            continue
-
-        # Find first non-zero observation to filter excessive leading zero observations
-        first_nonzero_idx = next((idx for idx, e in enumerate(earner_series) if e > 0), 0)
-        start_reg_idx = max(0, first_nonzero_idx - 1)
-
-        sub_weights = weights[start_reg_idx:]
-        sub_sum_w = sum(sub_weights)
-        norm_weights = [w / sub_sum_w for w in sub_weights] if sub_sum_w > 0 else [1.0 / len(sub_weights)] * len(sub_weights)
-        sub_tau = tau_vals[start_reg_idx:]
-        sub_n = n_vals[start_reg_idx:]
-        sub_e = earner_series[start_reg_idx:]
-
-        # Compute Laplace-smoothed logit targets: (E + 0.25) / (N + 50.0)
-        y_smoothed = []
-        for e_cnt, n_cnt in zip(sub_e, sub_n):
-            p_sm = (e_cnt + 0.25) / (n_cnt + 50.0)
-            y_smoothed.append(logit(p_sm * 100.0))
-
-        # Weighted regression of smoothed logit vs tau
-        sub_tau_mean = sum(w * t for w, t in zip(norm_weights, sub_tau))
-        sub_s_tt = sum(w * ((t - sub_tau_mean) ** 2) for w, t in zip(norm_weights, sub_tau))
-        y_sm_mean = sum(w * y for w, y in zip(norm_weights, y_smoothed))
-        s_ty = sum(w * (t - sub_tau_mean) * (y - y_sm_mean) for w, t, y in zip(norm_weights, sub_tau, y_smoothed))
-
-        ridge_y = 0.25 * sub_s_tt
-        slope_y = s_ty / (sub_s_tt + ridge_y) if (sub_s_tt + ridge_y) > 1e-9 else 0.0
-        slope_y = min(1.0, max(-1.0, slope_y))
-
-        # Logit trend prediction with saturation-damped horizon
-        y_logit_pred = y_smoothed[-1] + slope_y * delta_tau_eff
-
-        # Recency-weighted interval marginal rate (dE / dN):
-        int_recent_num = 0.0
-        int_recent_den = 0.0
-        half_life_int_sec = 14.0 * 3600.0
-        decay_int = math.log(2.0) / half_life_int_sec
-
-        for k in range(1, m):
-            dn = n_vals[k] - n_vals[k - 1]
-            if dn > 0:
-                de = max(0, earner_series[k] - earner_series[k - 1])
-                m_k = min(1.0, de / dn)
-                t_mid = 0.5 * (t_vals[k] + t_vals[k - 1])
-                w_k = dn * math.exp(-decay_int * max(0.0, t_last - t_mid))
-                int_recent_num += w_k * m_k
-                int_recent_den += w_k
-
-        m_recent = (int_recent_num / int_recent_den) if int_recent_den > 0 else (clamp(last_valid_rate) / 100.0)
-        tot_dn = n_vals[-1] - n_vals[0]
-        tot_de = max(0, earner_series[-1] - earner_series[0])
-        m_overall = (tot_de / tot_dn) if tot_dn > 50 else (clamp(last_valid_rate) / 100.0)
-
-        # Blend recent interval velocity (65%) with overall velocity (35%)
-        m_emp = 0.65 * m_recent + 0.35 * m_overall
-        # Shrunk toward current rate prior
-        p_prior = max(0.0001, min(0.9999, (last_earners + 0.25) / (n_vals[-1] + 50.0)))
-        marginal_rate = 0.60 * m_emp + 0.40 * p_prior
-
-        e_target = last_earners + marginal_rate * delta_n_proj
-        e_target = max(last_earners, min(n_target, e_target))
-
-        r_earner_pred = (e_target / n_target) * 100.0 if n_target > 0 else 0.01
-        y_earner_pred = logit(r_earner_pred)
-
-        # Combine damped logit trend with earner-growth projection (50/50 blend)
-        mu_combined = 0.50 * y_logit_pred + 0.50 * y_earner_pred
-
-        # Physical earner lower bound: earners cannot decrease
-        r_floor = (last_earners / n_target) * 100.0 if n_target > 0 else 0.01
-        mu_floor = logit(r_floor)
-        mu_combined = max(mu_floor, mu_combined)
-
-        # Fit residual variance on smoothed series
-        if len(sub_tau) > 2 and sub_s_tt > 1e-9:
-            res_sum_sq = sum(w * ((y - (y_sm_mean + slope_y * (t - sub_tau_mean))) ** 2) for w, t, y in zip(norm_weights, sub_tau, y_smoothed))
-            s_res_sq = res_sum_sq / max(1e-4, 1.0 - sum(w * w for w in norm_weights))
-            var_slope = (s_res_sq / sub_s_tt) * (delta_tau_eff ** 2)
-            sigma_fit = math.sqrt(min(0.35, s_res_sq + var_slope))
+        if p_info["is_zero"]:
+            # Zero-earner trophy spread: scaled smoothly with diffusion to cover week-1 first unlocks
+            spread = max(0.80, min(1.25, 1.5 * sigma_diffusion))
         else:
-            sigma_fit = 0.18
+            # Heteroscedastic per-trophy spread:
+            # diffusion + regression fit + Poisson count + model disagreement
+            sigma_fit = math.sqrt(min(0.35, p_info["s_res"] ** 2 + p_info["var_slope"]))
+            sigma_count = 0.30 / math.sqrt(max(4.0, float(p_info["last_earners"]) + 1.0))
+            sigma_disagree = 0.20 * min(2.0, abs(p_info["y_logit"] - p_info["y_earner"]))
 
-        # Combine diffusion (from rolling backtest) and fit uncertainty
-        spread = math.sqrt(sigma_diffusion**2 + 0.60 * sigma_fit**2)
-        spread = min(1.35, max(0.18, spread))
+            spread_sq = (
+                sigma_diffusion**2
+                + 0.50 * (sigma_fit**2)
+                + sigma_count**2
+                + sigma_disagree**2
+            )
+            spread = math.sqrt(spread_sq)
+            spread = min(1.10, max(0.18, spread))
 
-        pred_medians[i] = mu_combined
         pred_spreads[i] = spread
 
     # Hierarchy constraints:
@@ -491,8 +526,7 @@ def forecast_multi_refresh(
         if pred_medians[idx_14] > pred_medians[idx_7]:
             pred_medians[idx_14] = pred_medians[idx_7]
 
-    # Platinum "Vice Got a Price!" (ID 1) requires all other trophies:
-    # Platinum rate <= min of all other trophies
+    # Platinum "Vice Got a Price!" (ID 1) requires all other trophies
     if num_trophies > 1:
         min_other_median = min(pred_medians[1:])
         if pred_medians[0] > min_other_median:
